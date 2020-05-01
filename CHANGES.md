@@ -49,3 +49,5 @@ as much of the available functionality as possible.
 * [SSHD-984](https://issues.apache.org/jira/browse/SSHD-984) - Utility method to export KeyPair in OpenSSH format
 
 * [SSHD-992](https://issues.apache.org/jira/browse/SSHD-984) - Provide more hooks into the SFTP server subsystem via SftpFileSystemAccessor
+
+* [SSHD-989](https://issues.apache.org/jira/browse/SSHD-989) - Implement ECDSA public key recovery for PKCS8 encoded data
