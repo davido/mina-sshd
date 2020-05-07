@@ -158,10 +158,14 @@ public class ECDSAPEMResourceKeyPairParser extends AbstractPEMResourceKeyPairPar
             /*
              * According to https://tools.ietf.org/html/rfc5915 - section 3
              *
-             * ECPrivateKey ::= SEQUENCE { version INTEGER { ecPrivkeyVer1(1) } (ecPrivkeyVer1), privateKey OCTET
-             * STRING, parameters [0] ECParameters {{ NamedCurve }} OPTIONAL, publicKey [1] BIT STRING OPTIONAL }
+             * ECPrivateKey ::= SEQUENCE {
+             *      version INTEGER { ecPrivkeyVer1(1) } (ecPrivkeyVer1),
+             *      privateKey OCTET STRING,
+             *      parameters [0] ECParameters {{ NamedCurve }} OPTIONAL,
+             *      publicKey [1] BIT STRING OPTIONAL
+             * }
              */
-            ECPoint w = decodeECPublicKeyValue(curve, parser);
+            ECPoint w = decodeECPublicKeyValue(parser);
             ECPublicKeySpec pubSpec = new ECPublicKeySpec(w, prvSpec.getParams());
             return new SimpleImmutableEntry<>(pubSpec, prvSpec);
         }
@@ -183,8 +187,8 @@ public class ECDSAPEMResourceKeyPairParser extends AbstractPEMResourceKeyPairPar
         /*
          * According to https://tools.ietf.org/html/rfc5915 - section 3
          *
-         * For this version of the document, it SHALL be set to ecPrivkeyVer1, which is of type INTEGER and whose value
-         * is one (1)
+         * For this version of the document, it SHALL be set to ecPrivkeyVer1,
+         * which is of type INTEGER and whose value is one (1)
          */
         BigInteger version = versionObject.asInteger();
         if (!BigInteger.ONE.equals(version)) {
@@ -216,6 +220,7 @@ public class ECDSAPEMResourceKeyPairParser extends AbstractPEMResourceKeyPairPar
         }
 
         // TODO make sure params object tag is 0xA0
+        objType = paramsObject.getObjType();
 
         List<Integer> curveOID;
         try (DERParser paramsParser = paramsObject.createParser()) {
@@ -223,6 +228,12 @@ public class ECDSAPEMResourceKeyPairParser extends AbstractPEMResourceKeyPairPar
             if (namedCurve == null) {
                 throw new StreamCorruptedException("Missing named curve parameter");
             }
+
+            /*
+             * SSHD-989 - if object type is BIT STRING then this
+             * is the public key - in which case we need to figure
+             * out some other way to recover the curve parameters
+             */
 
             curveOID = namedCurve.asOID();
         }
@@ -253,7 +264,7 @@ public class ECDSAPEMResourceKeyPairParser extends AbstractPEMResourceKeyPairPar
      * @return             The encoded {@link ECPoint}
      * @throws IOException If failed to create the point
      */
-    public static final ECPoint decodeECPublicKeyValue(ECCurves curve, DERParser parser) throws IOException {
+    public static final ECPoint decodeECPublicKeyValue(DERParser parser) throws IOException {
         // see openssl asn1parse -inform PEM -in ...file... -dump
         ASN1Object dataObject = parser.readObject();
         if (dataObject == null) {
@@ -263,8 +274,8 @@ public class ECDSAPEMResourceKeyPairParser extends AbstractPEMResourceKeyPairPar
         /*
          * According to https://tools.ietf.org/html/rfc5915
          *
-         * Though the ASN.1 indicates publicKey is OPTIONAL, implementations that conform to this document SHOULD always
-         * include the publicKey field
+         * Though the ASN.1 indicates publicKey is OPTIONAL, implementations
+         * that conform to this document SHOULD always include the publicKey field
          */
         try (DERParser dataParser = dataObject.createParser()) {
             ASN1Object pointData = dataParser.readObject();
@@ -282,5 +293,4 @@ public class ECDSAPEMResourceKeyPairParser extends AbstractPEMResourceKeyPairPar
             return ECCurves.octetStringToEcPoint(octets);
         }
     }
-
 }
