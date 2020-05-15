@@ -35,10 +35,15 @@ import java.util.List;
 import java.util.Map;
 import java.util.Objects;
 import java.util.Queue;
+import java.util.concurrent.Callable;
 import java.util.concurrent.CopyOnWriteArraySet;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.TimeoutException;
+import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicLong;
 import java.util.concurrent.atomic.AtomicReference;
+import java.util.concurrent.locks.Lock;
+import java.util.concurrent.locks.ReentrantLock;
 import java.util.logging.Level;
 
 import org.apache.sshd.common.Closeable;
@@ -187,6 +192,7 @@ public abstract class AbstractSession extends SessionHelper {
     protected long maxRekyPackets = FactoryManager.DEFAULT_REKEY_PACKETS_LIMIT;
     protected long maxRekeyBytes = FactoryManager.DEFAULT_REKEY_BYTES_LIMIT;
     protected long maxRekeyInterval = FactoryManager.DEFAULT_REKEY_TIME_LIMIT;
+    protected final Lock pendingPacketsLock = new ReentrantLock();
     protected final Queue<PendingWriteFuture> pendingPackets = new LinkedList<>();
 
     protected Service currentService;
@@ -656,6 +662,38 @@ public abstract class AbstractSession extends SessionHelper {
         doKexNegotiation();
     }
 
+    /**
+     * Attempts to lock the pending packets access and execute the relevant code. Max. wait time is derived from the
+     * current number of pending packets
+     *
+     * @param  <V>       The executed code return value
+     * @param  extraWait An extra amount of time (msec.) that the caller is willing to wait beyond the time derived from
+     *                   the number of pending packets. <B>Note:</B> a hardcoded max. value of
+     *                   {@link FactoryManager#DEFAULT_AUTH_TIMEOUT} is imposed on the total calculated time.
+     * @param  executor  The code to execute under lock
+     * @return           The executed code result
+     * @throws Exception If failed to lock or exception thrown by executor code
+     * @see              <A HREF="https://issues.apache.org/jira/browse/SSHD-966">SSHD-966</A>
+     */
+    public <V> V executeUnderPendingPacketsLock(long extraWait, Callable<? extends V> executor) throws Exception {
+        ValidateUtils.checkTrue(extraWait >= 0L, "Invalid extra wait time: %d", extraWait);
+        int numPending = pendingPackets.size();
+        long maxWait = numPending * FactoryManager.DEFAULT_NIO2_MIN_WRITE_TIMEOUT + extraWait;
+        // in case zero
+        maxWait = Math.max(maxWait, FactoryManager.DEFAULT_NIO2_MIN_WRITE_TIMEOUT);
+        // in case lots of pending packets or large extra time
+        maxWait = Math.min(maxWait, FactoryManager.DEFAULT_AUTH_TIMEOUT);
+        if (!pendingPacketsLock.tryLock(maxWait, TimeUnit.MILLISECONDS)) {
+            throw new TimeoutException("Failed to acquire " + numPending + " pending packets lock");
+        }
+
+        try {
+            return executor.call();
+        } finally {
+            pendingPacketsLock.unlock();
+        }
+    }
+
     protected void doKexNegotiation() throws Exception {
         if (kexState.compareAndSet(KexState.DONE, KexState.RUN)) {
             sendKexInit();
@@ -669,9 +707,10 @@ public abstract class AbstractSession extends SessionHelper {
         KeyExchangeFactory kexFactory = NamedResource.findByName(
                 kexAlgorithm, String.CASE_INSENSITIVE_ORDER, kexFactories);
         ValidateUtils.checkNotNull(kexFactory, "Unknown negotiated KEX algorithm: %s", kexAlgorithm);
-        synchronized (pendingPackets) {
+        executeUnderPendingPacketsLock(0L, () -> {
             kex = kexFactory.createKeyExchange(this);
-        }
+            return kex;
+        });
 
         byte[] v_s = serverVersion.getBytes(StandardCharsets.UTF_8);
         byte[] v_c = clientVersion.getBytes(StandardCharsets.UTF_8);
@@ -707,12 +746,13 @@ public abstract class AbstractSession extends SessionHelper {
 
         signalSessionEvent(SessionListener.Event.KeyEstablished);
 
-        Collection<? extends Map.Entry<? extends SshFutureListener<IoWriteFuture>, IoWriteFuture>> pendingWrites;
-        synchronized (pendingPackets) {
-            pendingWrites = sendPendingPackets(pendingPackets);
-            kex = null; // discard and GC since KEX is completed
-            kexState.set(KexState.DONE);
-        }
+        Collection<? extends Map.Entry<? extends SshFutureListener<IoWriteFuture>, IoWriteFuture>> pendingWrites
+                = executeUnderPendingPacketsLock(FactoryManager.DEFAULT_NIO2_MIN_WRITE_TIMEOUT, () -> {
+                    List<Map.Entry<PendingWriteFuture, IoWriteFuture>> result = sendPendingPackets(pendingPackets);
+                    kex = null; // discard and GC since KEX is completed
+                    kexState.set(KexState.DONE);
+                    return result;
+                });
 
         int pendingCount = pendingWrites.size();
         if (pendingCount > 0) {
@@ -734,7 +774,7 @@ public abstract class AbstractSession extends SessionHelper {
         }
     }
 
-    protected List<SimpleImmutableEntry<PendingWriteFuture, IoWriteFuture>> sendPendingPackets(
+    protected List<Map.Entry<PendingWriteFuture, IoWriteFuture>> sendPendingPackets(
             Queue<PendingWriteFuture> packetsQueue)
             throws IOException {
         if (GenericUtils.isEmpty(packetsQueue)) {
@@ -742,7 +782,7 @@ public abstract class AbstractSession extends SessionHelper {
         }
 
         int numPending = packetsQueue.size();
-        List<SimpleImmutableEntry<PendingWriteFuture, IoWriteFuture>> pendingWrites = new ArrayList<>(numPending);
+        List<Map.Entry<PendingWriteFuture, IoWriteFuture>> pendingWrites = new ArrayList<>(numPending);
         synchronized (encodeLock) {
             for (PendingWriteFuture future = packetsQueue.poll();
                  future != null;
@@ -872,10 +912,11 @@ public abstract class AbstractSession extends SessionHelper {
      * Checks if key-exchange is done - if so, or the packet is related to the key-exchange protocol, then allows the
      * packet to go through, otherwise enqueues it to be sent when key-exchange completed
      *
-     * @param  buffer The {@link Buffer} containing the packet to be sent
-     * @return        A {@link PendingWriteFuture} if enqueued, {@code null} if packet can go through.
+     * @param  buffer      The {@link Buffer} containing the packet to be sent
+     * @return             A {@link PendingWriteFuture} if enqueued, {@code null} if packet can go through.
+     * @throws IOException If failed to enqueue
      */
-    protected PendingWriteFuture enqueuePendingPacket(Buffer buffer) {
+    protected PendingWriteFuture enqueuePendingPacket(Buffer buffer) throws IOException {
         if (KexState.DONE.equals(kexState.get())) {
             return null;
         }
@@ -887,20 +928,33 @@ public abstract class AbstractSession extends SessionHelper {
         }
 
         String cmdName = SshConstants.getCommandMessageName(cmd);
+        AtomicInteger numPending = new AtomicInteger();
         PendingWriteFuture future;
-        int numPending;
-        synchronized (pendingPackets) {
-            if (KexState.DONE.equals(kexState.get())) {
-                return null;
-            }
+        try {
+            future = executeUnderPendingPacketsLock(0L, () -> {
+                if (KexState.DONE.equals(kexState.get())) {
+                    return null;
+                }
 
-            future = new PendingWriteFuture(cmdName, buffer);
-            pendingPackets.add(future);
-            numPending = pendingPackets.size();
+                PendingWriteFuture pending = new PendingWriteFuture(cmdName, buffer);
+                pendingPackets.add(pending);
+                numPending.set(pendingPackets.size());
+                return pending;
+            });
+        } catch (Exception e) {
+            log.error("enqueuePendingPacket(" + this + ")[" + cmdName + "] failed to generate future", e);
+
+            if (e instanceof IOException) {
+                throw (IOException) e;
+            } else if (e instanceof RuntimeException) {
+                throw (RuntimeException) e;
+            } else {
+                throw new RuntimeSshException(e);
+            }
         }
 
         if (log.isDebugEnabled()) {
-            if (numPending == 1) {
+            if (numPending.get() == 1) {
                 log.debug("enqueuePendingPacket({})[{}] Start flagging packets as pending until key exchange is done", this,
                         cmdName);
             } else {
